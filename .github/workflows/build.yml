@@ -1,1 +1,133 @@
+# APK banane ka workflow / Workflow to build a debug APK from an uploaded zip
+# Repo ke root mein sirf EK zip rakhein (jaise app.zip). Zip upload karte hi APK ban jayegi.
+name: Build APK
+on:
+  push:
+    paths:
+      - '*.zip'            # sirf zip badalne par chale (build.yml badalne par nahi) / run only when a zip changes
+  workflow_dispatch:
+
+# Naya push aaye to purani atki run band ho jaye / a newer push cancels an older stuck run
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # Release banane ke liye / needed to publish the release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40   # 40 min se zyada atke to apne-aap band + log mile / auto-stop a hung build
+    steps:
+      - uses: actions/checkout@v4
+
+      # Zip ko kholo / unzip the uploaded source zip
+      - name: Unzip source
+        run: |
+          set -e
+          # हमेशा सबसे नई (नाम में आख़िरी) zip लो — पुरानी zip repo में रह गई हो तो भी / always pick the newest (last by name) zip, even if old zips remain
+          # किट वाली zip (नाम में KIT) को छोड़ो — सिर्फ़ ऐप की zip / skip any *KIT* zip uploaded by mistake
+          z=$(ls *.zip | grep -vi 'kit' | sort | tail -n 1)
+          if [ -z "$z" ]; then echo "❌ Repo में ऐप की Zip नहीं मिली / no app zip in the repo"; ls -la; exit 1; fi
+          echo "Using $z"
+          mkdir -p src
+          unzip -qo "$z" -d src
+          # agar zip ke andar ek folder hai to usme jao / handle nested folder
+          f=$(find src -maxdepth 4 -name settings.gradle.kts -not -path '*/build/*' | head -n 1)
+          if [ -z "$f" ]; then echo "❌ Zip में settings.gradle.kts नहीं मिली / settings.gradle.kts not found in the zip"; find src -maxdepth 3 | head -50; exit 1; fi
+          d=$(dirname "$f")
+          echo "Project folder: $d"; ls -la "$d"
+          echo "PROJECT_DIR=$d" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # Android SDK mashin mein pehle se hai; sirf licenses accept karo
+      # SDK is preinstalled on the runner; just accept licenses
+      - name: Accept Android licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          echo "sdk.dir=$ANDROID_HOME" > "$PROJECT_DIR/local.properties"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.3.1
+
+      # CI par in-process Kotlin aur configuration-cache band (KSP error se bachne ke liye)
+      # Disable in-process Kotlin strategy & configuration cache on CI (avoids KSP NPE)
+      - name: Fix gradle.properties for CI
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          echo "PROJECT_DIR=$PROJECT_DIR"; pwd; ls -la
+          touch gradle.properties   # फ़ाइल न हो तो बना दो / create it if the project has none
+          sed -i '/kotlin.compiler.execution.strategy/d;/org.gradle.configuration-cache/d;/org.gradle.caching/d;/org.gradle.jvmargs/d;/org.gradle.parallel/d;/org.gradle.workers.max/d;/kotlin.daemon.jvmargs/d' gradle.properties
+          # headless = KSP/AWT वाली "AWT-EventQueue" गड़बड़ी और अटकना बंद; कम workers = Memory न भरे
+          # headless stops the KSP/AWT EventQueue thread; fewer workers keep memory in check (processDebugResources hang)
+          echo "org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8 -Djava.awt.headless=true" >> gradle.properties
+          echo "kotlin.daemon.jvmargs=-Xmx2g -Djava.awt.headless=true" >> gradle.properties   # Kotlin ko alag seema / cap Kotlin memory
+          echo "org.gradle.parallel=false" >> gradle.properties
+          echo "org.gradle.workers.max=2" >> gradle.properties
+
+      # debug.keystore: repo ke root mein debug.keystore ho to wahi use karo (har baar ek hi signature =
+      # APK bina uninstall kiye update hoti hai). Na ho to naya banao (tab update ke liye uninstall karna padega).
+      # Use the repo-root debug.keystore if present (same signature every build = installs as an update, no uninstall);
+      # otherwise generate a new one (each build then has a different signature).
+      - name: Prepare debug keystore
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/debug.keystore" ]; then
+            echo "Using fixed debug.keystore from repo root"
+            cp "$GITHUB_WORKSPACE/debug.keystore" debug.keystore
+          else
+            echo "WARNING: no debug.keystore in repo root - generating a new one (updates will need uninstall)"
+            keytool -genkeypair -v -keystore debug.keystore -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        timeout-minutes: 30
+        run: |
+          # हर मिनट Memory लॉग में — अटके तो कारण दिखे / log memory every minute to diagnose a hang
+          ( while true; do sleep 60; echo "== $(date +%H:%M:%S) MEM(MB): $(free -m | awk 'NR==2{print $3"/"$2}') =="; done ) &
+          MON=$!
+          export JAVA_TOOL_OPTIONS="-Djava.awt.headless=true"
+          gradle assembleDebug --stacktrace --no-daemon --console=plain --max-workers=2 2>&1 | tee build.log; rc=${PIPESTATUS[0]}
+          kill $MON 2>/dev/null || true
+          test $rc -eq 0
+
+      # Fail ho ya pass, log hamesha save karo / always keep the log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: ${{ env.PROJECT_DIR }}/build.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+
+      # APK sahi hai ya nahi jaanch / verify the APK is valid
+      - name: Verify APK
+        run: |
+          APK=$(ls "$PROJECT_DIR"/app/build/outputs/apk/debug/*.apk | head -n 1)
+          ls -l "$APK"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          "$BT/apksigner" verify --verbose "$APK" || true
+          "$BT/aapt2" dump badging "$APK" | head -n 8 || true
+          cp "$APK" "$GITHUB_WORKSPACE/app-debug.apk"
+
+      # APK seedhe Releases page par (bina zip) / publish APK directly (no zip)
+      - name: Publish release with APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" app-debug.apk \
+            --title "APK build ${{ github.run_number }}" \
+            --notes "Debug APK (testing only) - commit ${{ github.sha }}"
 
